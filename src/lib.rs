@@ -78,35 +78,39 @@ impl Drop for HazardPtrHolder {
 }
 
 pub trait Deleter { 
-    fn delete(&'static self, ptr: *mut dyn Drop);
+    unsafe fn delete(&'static self, ptr: *mut dyn Reclaim);
 }
 
-impl Deleter for fn(*mut dyn Drop) { 
-    fn delete(&'static self, ptr: *mut dyn Drop) { 
-        (*self)(ptr)
+impl Deleter for unsafe fn(*mut dyn Reclaim) { 
+    unsafe fn delete(&'static self, ptr: *mut dyn Reclaim) { 
+        unsafe { (*self)(ptr) }
     }
 }
 
 pub mod deleter { 
     use super::*;
 
-    fn drop_box(ptr: *mut dyn Drop) { 
+    unsafe fn drop_box(ptr: *mut dyn Reclaim) { 
+        println!("drop box is bieng called");
             let _ = unsafe { Box::from_raw(ptr)};
-        }
+    }
 
-    pub static DROP_BOX: fn(*mut dyn Drop) = drop_box;
+    pub static DROP_BOX: unsafe fn(*mut dyn Reclaim) = drop_box;
 
 
-    fn drop_in_place(ptr: *mut dyn Drop) { 
+    unsafe fn drop_in_place(ptr: *mut dyn Reclaim) { 
             unsafe { std::ptr::drop_in_place(ptr)};
         }
 
-    pub static DROP_IN_PLACE: fn(*mut dyn Drop) = drop_in_place;
+    pub static DROP_IN_PLACE: unsafe fn(*mut dyn Reclaim) = drop_in_place;
 
 }
 
+pub trait Reclaim {}
+impl<T> Reclaim for T {}
+
 pub trait HazardPtrObject
-where Self: Drop + Sized + 'static
+where Self: Reclaim + Sized + 'static
 {
     fn domain(&self) -> &HazardPtrDomain;
     // safety contracts
@@ -115,7 +119,10 @@ where Self: Drop + Sized + 'static
     // caller also has to make sure that deleter is valid drop anyway 
     // so its okay to deref it. 
     unsafe fn retire(me: *mut Self, deleter: &'static dyn Deleter) {
-        unsafe { &*me }.domain().retire(me as *mut dyn Drop, deleter) 
+        if !std::mem::needs_drop::<Self>() {
+            return;
+        } 
+        unsafe { &*me }.domain().retire(me as *mut dyn Reclaim, deleter) 
     }
 }
 
@@ -131,12 +138,6 @@ impl<T: 'static> HazardPtrObject for HazardPtrObjectWrapper<T> {
     fn domain(&self) -> &HazardPtrDomain { 
         &SHARED_DOMAIN
     }    
-}
-impl<T> Drop for HazardPtrObjectWrapper<T> { 
-    fn drop(&mut self) {
-        println!("this is being called");
-        todo!()
-    }
 }
 impl<T> HazardPtrObjectWrapper<T> { 
     pub fn new_with_default(t: T ) -> Self { 
@@ -162,7 +163,7 @@ struct HazardPtrs {
 }
 
 struct Retired { 
-    ptr: *mut dyn Drop,
+    ptr: *mut dyn Reclaim,
     deleter: &'static dyn Deleter,
     next: AtomicPtr<Retired>
 }
@@ -222,7 +223,7 @@ impl HazardPtrDomain {
         };
         unsafe { &* node }
     }
-    pub fn retire(&self, ptr: *mut dyn Drop, deleter: &'static dyn Deleter) {
+    pub fn retire(&self, ptr: *mut dyn Reclaim, deleter: &'static dyn Deleter) {
         // first stick to the list of retired
         let retired = Box::into_raw(Box::new(Retired { 
             ptr,
@@ -251,26 +252,28 @@ impl HazardPtrDomain {
         //lets do the reclaim
         // if the count is bigger than zero reclaim the objects
         if self.retired.count.load(Ordering::SeqCst) != 0 {
-            self.bulk_reclaim(); 
+            self.bulk_reclaim(0, false); 
         }
         // compare the value in the tables, not the vtables,
         // (ptr, d)
         
     }
-    fn bulk_reclaim(&self) { 
+    fn bulk_reclaim(&self, prev_reclaimed: usize, block: bool) -> usize { 
        let steal = self.retired.head.swap(
         std::ptr::null_mut(), 
         Ordering::SeqCst);
         if steal.is_null() { 
             // nothing to reclaim (might be already reclaimed or something) fallback
-            return;
+            return 0;
         }
         let mut guarded_ptrs = HashSet::new();
         // walk the list of haz ptrs and find all the ptrs those are still being guarded
         let mut node = self.hazptrs.head.load(Ordering::SeqCst);
         while !node.is_null() { 
             let n = unsafe { &*node };
-            guarded_ptrs.insert(n.ptr.load(Ordering::SeqCst));
+            if n.active.load(Ordering::SeqCst) { 
+                guarded_ptrs.insert(n.ptr.load(Ordering::SeqCst));
+            }
             node = n.next.load(Ordering::SeqCst);
         }
 
@@ -280,26 +283,31 @@ impl HazardPtrDomain {
         let mut reclaimed = 0usize;
         let mut tail = None;
         while !node.is_null() { 
-            let mut n = unsafe { Box::from_raw(node) };
-            node = *n.next.get_mut();
+            let current = node; 
+            let n = unsafe {&*current};
+            node = n.next.load(Ordering::SeqCst);
             if guarded_ptrs.contains(&(n.ptr as *mut u8)) { 
                 // being guarded by readers and writers not safe to reclaim
-                *n.next.get_mut() = remaining;
-                remaining = Box::into_raw(n);
+                n.next.store(remaining, Ordering::SeqCst);
+                remaining = current;
                 if tail.is_none() { 
                     tail = Some(remaining);
                 }
             } else { 
+                let n = unsafe { Box::from_raw(current)};
                 // now we can reclaim it no longer being guarded
                 reclaimed += 1;
-                n.deleter.delete(n.ptr)
+                unsafe { n.deleter.delete(n.ptr) }
             }
         }
         self.retired.count.fetch_sub(reclaimed, Ordering::SeqCst);
+        let total_reclaimed = prev_reclaimed + reclaimed; 
         let tail = if let Some(tail) = tail { 
+            assert!(!remaining.is_null());
             tail
-        } else { 
-            return;
+        } else {
+            assert!(remaining.is_null()); 
+            return total_reclaimed;
         };
 
         let head_ptr = &self.retired.head;
@@ -319,32 +327,47 @@ impl HazardPtrDomain {
                     head = head_already
                 }
             }
-        }        
+        }
+
+        if !remaining.is_null() && block {
+            // caller wants to reclaim if anythign is left, must call reclaim
+            std::thread::yield_now(); 
+            // tail recursion
+            return self.bulk_reclaim(reclaimed, true);
+        }
+        reclaimed        
     }
     
-    pub fn eager_reclaim(&self)  {
-        self.bulk_reclaim();
+    pub fn eager_reclaim(&self, block: bool) -> usize  {
+        return self.bulk_reclaim(0, block);
     }
 }
 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicPtr;
+    use std::sync::{Arc, atomic::{AtomicPtr, AtomicUsize, Ordering}};
 
     use crate::{HazardPtrHolder, HazardPtrObject, HazardPtrObjectWrapper, SHARED_DOMAIN, deleter};
-    
+   struct CountDrops(Arc<AtomicUsize>);
+   impl Drop for CountDrops { 
+    fn drop(&mut self) {
+        println!("thsi drop is being called");
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+   } 
     #[test]
    fn first_test() { 
         println!("set started");
+        let drops_42 = Arc::new(AtomicUsize::new(0));
         let x = AtomicPtr::new(Box::into_raw(Box::new(
-            HazardPtrObjectWrapper::new_with_default(42 as i32)
+            HazardPtrObjectWrapper::new_with_default((42 as i32, CountDrops(Arc::clone(&drops_42))))
         )));
         // as a reader
         let mut holder = HazardPtrHolder::default();
         
         let my_value = unsafe { holder.load(&x) .expect("not null") };
-        assert_eq!(**my_value, 42);
+        assert_eq!(my_value.0, 42);
         
         holder.reset();
 
@@ -352,19 +375,21 @@ mod tests {
         //let _ = **my_value;
         let my_value = unsafe { holder.load(&x) .expect("not null") };
         // valid
-        assert_eq!(**my_value, 42);
+        assert_eq!(my_value.0, 42);
         //drop(holder);
 
         // invalid again
 
         let mut holder_temp = HazardPtrHolder::default();
-        let val_temp = unsafe { holder_temp.load(&x).expect("not null") };
-        assert_eq!(**val_temp, 42);
-
+        let _ = unsafe { holder_temp.load(&x).expect("not null") };
+        drop(holder_temp);
+        //assert_eq!(val_temp.0, 42);
+        let drops_16 = Arc::new(AtomicUsize::new(0));
+        
         // as a writer 
         let old = x.swap(
             Box::into_raw(Box::new(
-                HazardPtrObjectWrapper::new_with_default(16)
+                HazardPtrObjectWrapper::new_with_default((16, CountDrops(Arc::clone(&drops_16))))
             )),
             std::sync::atomic::Ordering::SeqCst
         );
@@ -374,25 +399,32 @@ mod tests {
         // retire is being called only by hazardptrobject 
         // old is no longer in use, have already been swapped, safe to retire
         unsafe { HazardPtrObjectWrapper::retire(old, &deleter::DROP_BOX); };
-        let old_value = unsafe { **old };
+
         // we have swapped the the raw pointer with new value, and then we have retired via hazard pointer object retired,
         // i think the wrapper type of objectWrapper from where the raw pointer came from ( e.g Box) that
         // destructor is being called, but the actual raw pointer is still there, i still wonder how i am still able 
         // to deref the hazardptr, 
-        assert_eq!(old_value, 42);
 
-        let mut holder_2 = HazardPtrHolder::default();
-        let my_value_x2 = unsafe { holder_2.load(&x).expect("not null") };
-        assert_eq!(**my_value_x2, 16);
+        // let mut holder_2 = HazardPtrHolder::default();
+        // let _ = unsafe { holder_2.load(&x).expect("not null") };
+        // drop(holder_2); 
+        //assert_eq!(my_value_x2.0, 16);
+        assert_eq!(drops_42.load(Ordering::SeqCst), 0);
 
+        assert_eq!(my_value.0, 42);
+        assert_eq!(drops_42.load(Ordering::SeqCst), 0);
 
-        assert_eq!(**my_value, 42);
+        let _ = SHARED_DOMAIN.eager_reclaim(false);
+        assert_eq!(drops_42.load(Ordering::SeqCst), 0);
 
-        SHARED_DOMAIN.eager_reclaim();
-
-        assert_eq!(**my_value, 42);
+        assert_eq!(my_value.0, 42);
         drop(holder);
-        SHARED_DOMAIN.eager_reclaim();
+        
+        let n = SHARED_DOMAIN.eager_reclaim(false);
+        assert_eq!(n, 1);
+        assert_eq!(drops_42.load(Ordering::SeqCst), 1);
+        
+
         // TODO: check wheather it is reclaimed
 
     }
