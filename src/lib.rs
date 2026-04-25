@@ -119,9 +119,6 @@ where Self: Reclaim + Sized + 'static
     // caller also has to make sure that deleter is valid drop anyway 
     // so its okay to deref it. 
     unsafe fn retire(me: *mut Self, deleter: &'static dyn Deleter) {
-        if !std::mem::needs_drop::<Self>() {
-            return;
-        } 
         unsafe { &*me }.domain().retire(me as *mut dyn Reclaim, deleter) 
     }
 }
