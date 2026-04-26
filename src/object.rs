@@ -1,9 +1,9 @@
 use std::ops::{Deref, DerefMut};
-use crate::{HazardPtrDomain, SHARED_DOMAIN, Deleter, Reclaim};
-pub trait HazardPtrObject
-where Self:  Sized + 'static
+use crate::{HazardPtrDomain,  Deleter, Reclaim};
+pub trait HazardPtrObject<'domain>
+where Self:  Sized + 'domain
 {
-    fn domain(&self) -> &HazardPtrDomain;
+    fn domain(&self) -> &'domain HazardPtrDomain;
     // safety contracts
     // caller has to gurantee that the pointer addrss is valid
     // caller also has to gurantee that self is no longer accessible by other readers,
@@ -18,21 +18,22 @@ where Self:  Sized + 'static
 // so here is the thing any raw pointer of any type T; this is just the wrapper type of 
 // that raw pointer and thus by dereferncing it will handover the pointer which is the raw one. 
 
-pub struct HazardPtrObjectWrapper<T> { 
+pub struct HazardPtrObjectWrapper<'domain, T> { 
     inner: T, 
+    domain: &'domain HazardPtrDomain
 }
 
-impl<T: 'static> HazardPtrObject for HazardPtrObjectWrapper<T> { 
-    fn domain(&self) -> &HazardPtrDomain { 
-        &SHARED_DOMAIN
+impl<'domain, T: 'domain> HazardPtrObject<'domain> for HazardPtrObjectWrapper<'domain, T> { 
+    fn domain(&self) -> &'domain HazardPtrDomain { 
+        self.domain
     }    
 }
-impl<T> HazardPtrObjectWrapper<T> { 
+impl<T> HazardPtrObjectWrapper<'static, T> { 
     pub fn new_with_default(t: T ) -> Self { 
-        Self { inner: t}
+        Self { inner: t, domain: HazardPtrDomain::global}
     }
 } 
-impl<T> Deref for HazardPtrObjectWrapper<T> {
+impl<T> Deref for HazardPtrObjectWrapper<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -40,7 +41,7 @@ impl<T> Deref for HazardPtrObjectWrapper<T> {
     }
 }
 
-impl<T> DerefMut for HazardPtrObjectWrapper<T> { 
+impl<T> DerefMut for HazardPtrObjectWrapper<'_, T> { 
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }

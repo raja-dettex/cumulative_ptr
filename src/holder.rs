@@ -1,6 +1,11 @@
 use std::sync::atomic::{ AtomicPtr, Ordering};
-use crate::HazardPtr;
-use crate::SHARED_DOMAIN;
+use crate::{HazardPtr, HazardPtrDomain};
+
+const SHARED_DOMAIN: &'static HazardPtrDomain = HazardPtrDomain::global;
+
+// this is sort of classic holder of any pointer which is atomic ptr pointing to raw pointer
+//  
+
 #[derive(Default)]
 pub struct HazardPtrHolder(Option<&'static HazardPtr>);
 
