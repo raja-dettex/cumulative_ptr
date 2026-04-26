@@ -9,5 +9,4 @@ pub use holder::{HazardPtrHolder};
 pub use ptr::{HazardPtr};
 pub use deleter::{Reclaim, Deleter, deleters};
 pub use domain::{HazardPtrDomain};
-pub(crate) use domain::SHARED_DOMAIN;
 pub use object::{HazardPtrObject, HazardPtrObjectWrapper};

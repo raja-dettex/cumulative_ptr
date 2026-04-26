@@ -1,6 +1,6 @@
 use std::sync::{Arc, atomic::{AtomicPtr, AtomicUsize, Ordering}};
 
-use crate::{HazardPtrHolder, HazardPtrObject, HazardPtrObjectWrapper, SHARED_DOMAIN, deleters};
+use crate::{HazardPtrDomain, HazardPtrHolder, HazardPtrObject, HazardPtrObjectWrapper, deleters};
 struct CountDrops(Arc<AtomicUsize>);
 impl Drop for CountDrops { 
     fn drop(&mut self) {
@@ -8,6 +8,8 @@ impl Drop for CountDrops {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
 } 
+
+const SHARED_DOMAIN: &'static HazardPtrDomain = HazardPtrDomain::global;
 #[test]
 fn first_test() { 
     println!("set started");
